@@ -129,6 +129,16 @@ inverted-index-builder stats ./index
 inverted-index-builder lookup ./index search
 ```
 
+Try it end-to-end against the tiny fixture checked into `samples/tiny_example/`
+(three hand-written documents sharing enough vocabulary — "search", "python",
+"inverted index" — to produce real multi-document postings):
+
+```bash
+inverted-index-builder build samples/tiny_example/documents.jsonl --output-dir /tmp/index-example
+inverted-index-builder stats /tmp/index-example
+inverted-index-builder lookup /tmp/index-example search
+```
+
 It can also be invoked as a module: `python -m inverted_index_builder build ...`.
 
 ## Data formats
