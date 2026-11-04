@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,15 @@ from inverted_index_builder.tokenizer import tokenize as _default_tokenize
 _Occurrences = dict[str, dict[int, list[int]]]
 
 
+def read_documents(documents_path: Path) -> Iterator[dict[str, Any]]:
+    with documents_path.open("r", encoding="utf-8") as documents_file:
+        for raw_line in documents_file:
+            line = raw_line.strip()
+            if line:
+                record: dict[str, Any] = json.loads(line)
+                yield record
+
+
 class IndexBuilder:
     """Construye un `InvertedIndex` en memoria a partir de un `documents.jsonl`.
 
@@ -41,18 +51,24 @@ class IndexBuilder:
         self._tokenizer = tokenizer
 
     def build(self, documents_path: Path) -> InvertedIndex:
+        return self.build_from_records(read_documents(documents_path))
+
+    def build_from_records(
+        self, records: Iterable[dict[str, Any]], *, first_doc_id: int = 0
+    ) -> InvertedIndex:
+        """Construye el índice de `records` asignando `doc_id` consecutivos a
+        partir de `first_doc_id`. Un `first_doc_id` distinto de 0 es lo que
+        permite a `segments.py` construir segmentos con IDs globales que no
+        chocan con los de segmentos anteriores."""
+        if first_doc_id < 0:
+            raise ValueError(f"first_doc_id debe ser >= 0, recibido {first_doc_id}")
         documents: dict[int, DocumentRecord] = {}
         occurrences: _Occurrences = defaultdict(dict)
 
-        doc_id = 0
-        with documents_path.open("r", encoding="utf-8") as documents_file:
-            for raw_line in documents_file:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                self._index_document(doc_id, record, documents, occurrences)
-                doc_id += 1
+        doc_id = first_doc_id
+        for record in records:
+            self._index_document(doc_id, record, documents, occurrences)
+            doc_id += 1
 
         postings_lists = self._finalize_postings(occurrences)
         stats = self._compute_stats(documents, postings_lists)
