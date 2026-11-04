@@ -152,3 +152,26 @@ class TestRunLookup:
         args = parser.parse_args(["lookup", str(tmp_path / "missing"), "search"])
 
         assert _run_lookup(args) == 2
+
+
+def test_segments_cli_add_delete_merge_compact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from inverted_index_builder.__main__ import main
+
+    batch = tmp_path / "batch.jsonl"
+    batch.write_text(
+        '{"url": "a", "title": "A", "main_text": "red fish"}\n'
+        '{"url": "b", "title": "B", "main_text": "blue fish"}\n',
+        encoding="utf-8",
+    )
+    root = tmp_path / "idx"
+    assert main(["segments", "add", str(root), str(batch)]) == 0
+    assert main(["segments", "add", str(root), str(batch)]) == 0
+    assert main(["segments", "delete", str(root), "a"]) == 0
+    assert main(["segments", "merge", str(root), "--merge-factor", "2"]) == 0
+    assert main(["segments", "compact", str(root), "--output-dir", str(tmp_path / "v1")]) == 0
+    assert main(["segments", "stats", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert "Documentos vivos: 1" in output
+    assert main(["segments", "stats", str(tmp_path / "missing")]) == 2

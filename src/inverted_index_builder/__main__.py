@@ -11,7 +11,12 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from inverted_index_builder.pipeline import IndexBuilder
+from inverted_index_builder.pipeline import IndexBuilder, read_documents
+from inverted_index_builder.segments import (
+    SegmentedIndex,
+    SegmentedIndexError,
+    TieredMergePolicy,
+)
 from inverted_index_builder.serialization import read_index, write_index
 
 
@@ -41,7 +46,67 @@ def _build_parser() -> argparse.ArgumentParser:
     lookup_parser.add_argument("index_dir", type=Path)
     lookup_parser.add_argument("term", type=str)
 
+    segments_parser = subparsers.add_parser(
+        "segments", help="Índice segmentado incremental (altas, bajas, fusiones)"
+    )
+    segments_sub = segments_parser.add_subparsers(dest="segments_command", required=True)
+    add_parser = segments_sub.add_parser("add", help="Añade o actualiza documentos")
+    add_parser.add_argument("root", type=Path)
+    add_parser.add_argument("documents_path", type=Path)
+    delete_parser = segments_sub.add_parser("delete", help="Borra documentos por URL")
+    delete_parser.add_argument("root", type=Path)
+    delete_parser.add_argument("urls", nargs="+")
+    merge_parser = segments_sub.add_parser("merge", help="Aplica la política de fusión")
+    merge_parser.add_argument("root", type=Path)
+    merge_parser.add_argument("--merge-factor", type=int, default=4)
+    merge_parser.add_argument("--max-deleted-ratio", type=float, default=0.3)
+    compact_parser = segments_sub.add_parser(
+        "compact", help="Escribe los documentos vivos como un índice v1 clásico"
+    )
+    compact_parser.add_argument("root", type=Path)
+    compact_parser.add_argument("--output-dir", type=Path, required=True)
+    segments_stats_parser = segments_sub.add_parser("stats", help="Segmentos y borrados")
+    segments_stats_parser.add_argument("root", type=Path)
+
     return parser
+
+
+def _run_segments(args: argparse.Namespace) -> int:
+    root: Path = args.root
+    try:
+        if args.segments_command == "add":
+            if not args.documents_path.exists():
+                print(f"Error: no existe {args.documents_path}", file=sys.stderr)
+                return 2
+            index = SegmentedIndex.open_or_create(root)
+            doc_ids = index.add_documents(read_documents(args.documents_path))
+            print(f"Segmento añadido con {len(doc_ids)} documentos")
+            return 0
+        index = SegmentedIndex.open(root)
+        if args.segments_command == "delete":
+            print(f"Documentos borrados: {index.delete_urls(args.urls)}")
+        elif args.segments_command == "merge":
+            policy = TieredMergePolicy(args.merge_factor, args.max_deleted_ratio)
+            for report in index.maybe_merge(policy):
+                print(
+                    f"{' + '.join(report.merged)} -> {report.into or '(vacío)'}: "
+                    f"{report.live_documents} vivos, {report.expunged_documents} purgados"
+                )
+        elif args.segments_command == "compact":
+            compacted = index.compact(args.output_dir)
+            print(f"Índice v1 escrito con {compacted.stats.total_documents} documentos")
+        else:
+            manifest = index.manifest
+            print(f"Generación: {manifest.generation}")
+            print(f"Documentos vivos: {manifest.live_documents}")
+            for segment in manifest.segments:
+                print(
+                    f"  {segment.name}: {segment.doc_count} docs, {segment.deleted_count} borrados"
+                )
+    except SegmentedIndexError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _run_build(args: argparse.Namespace) -> int:
@@ -109,6 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_stats(args)
     if args.command == "lookup":
         return _run_lookup(args)
+    if args.command == "segments":
+        return _run_segments(args)
 
     parser.error(f"Comando desconocido: {args.command}")
     return 2  # inalcanzable: parser.error() termina el proceso con sys.exit()
