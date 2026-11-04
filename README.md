@@ -100,7 +100,8 @@ src/inverted_index_builder/
 ├── tokenizer.py       # from-scratch Unicode-aware tokenizer (NFC + casefold)
 ├── pipeline.py         # IndexBuilder: orchestrates tokenization + postings aggregation
 ├── serialization.py      # on-disk index format: write_index / read_index
-└── __main__.py             # CLI (`build`, `stats`, `lookup`)
+├── segments.py            # incremental segmented index: segments, tombstones, merges
+└── __main__.py             # CLI (`build`, `stats`, `lookup`, `segments ...`)
 ```
 
 ## Requirements and installation
@@ -140,6 +141,25 @@ inverted-index-builder lookup /tmp/index-example search
 ```
 
 It can also be invoked as a module: `python -m inverted_index_builder build ...`.
+
+### Incremental updates (segmented index)
+
+```bash
+# First batch creates the index; later batches add a new immutable segment.
+# A URL that is already live is treated as an update of that document.
+inverted-index-builder segments add ./seg-index ./batch-001.jsonl
+inverted-index-builder segments add ./seg-index ./batch-002.jsonl
+
+# Tombstone documents that disappeared from the web
+inverted-index-builder segments delete ./seg-index https://example.com/gone
+
+# Apply the tiered merge policy (merges similar-sized segments, purges deletes)
+inverted-index-builder segments merge ./seg-index --merge-factor 4
+
+# Write every live document as a classic single-directory (v1) index
+inverted-index-builder segments compact ./seg-index --output-dir ./index
+inverted-index-builder segments stats ./seg-index
+```
 
 ## Data formats
 
@@ -199,6 +219,67 @@ document IDs.
 }
 ```
 
+### Segmented index (`segments.json`, segmented format v1)
+
+Added in `0.2.0`. A segmented index is a directory of immutable segments plus
+per-segment tombstones, so a changed page costs one small new segment instead
+of a full rebuild:
+
+```text
+seg-index/
+├── segments.json                 # manifest, replaced atomically on every commit
+├── seg-000001/                   # a segment: exactly the v1 format above
+├── seg-000004/
+└── deletes/
+    └── seg-000001-g000007.json   # tombstones of seg-000001 as of generation 7
+```
+
+```json
+{
+  "format": "beacon-segmented-index",
+  "format_version": 1,
+  "generation": 7,
+  "next_doc_id": 1520,
+  "next_segment_number": 5,
+  "segments": [
+    {"name": "seg-000001", "doc_count": 1000, "deleted_count": 12,
+     "deletes_file": "deletes/seg-000001-g000007.json"},
+    {"name": "seg-000004", "doc_count": 520, "deleted_count": 0, "deletes_file": null}
+  ]
+}
+```
+
+A tombstones file is `{"segment": "seg-000001", "deleted_doc_ids": [3, 17, ...]}`,
+sorted ascending. The rules a reader can rely on:
+
+- **Every segment is a valid v1 index.** Any reader of the v1 format can open
+  a single segment; to search the whole index it has to read every segment
+  listed in `segments.json` and skip the doc_ids in that segment's
+  tombstones. `bm25-ranking-engine` does exactly that from `0.2.0`.
+- **doc_ids are global and stable.** New segments take ids from
+  `next_doc_id`; merges keep the ids of surviving documents. External signals
+  keyed by doc_id (PageRank scores, snippets) survive merges. Inside a segment
+  ids are ascending but may have gaps.
+- **Corpus statistics are not stored per segment for the whole index**: each
+  segment's `stats.json` describes that segment alone. Readers recompute
+  `total_documents`, `average_document_length` and document frequencies over
+  live documents only.
+- **Commits are atomic.** New files are written first and `segments.json` is
+  swapped with `os.replace`, so a reader always sees a complete generation.
+  Files left over by a crash are removed the next time the index is opened.
+- **Single writer.** One process owns a segmented index; `BackgroundMerger`
+  merges in a background thread sharing that process's lock.
+- **Backward compatibility.** The single-directory v1 format is unchanged
+  and still the default output of `build`. `segments compact` turns a
+  segmented index back into one v1 directory for readers that do not know
+  `segments.json`.
+
+The merge policy is tiered (a simplified Lucene `TieredMergePolicy`): segments
+are grouped by size tier `floor(log_merge_factor(live docs))`, and when a tier
+holds `merge_factor` segments the oldest ones are merged, so every document is
+rewritten O(log N) times over its lifetime. A segment with more than
+`max_deleted_ratio` tombstones is rewritten on its own to purge them.
+
 ## Programmatic usage
 
 ```python
@@ -216,6 +297,18 @@ postings = index.postings_lists["search"]
 print(postings.document_frequency, [p.doc_id for p in postings.postings])
 ```
 
+Incremental updates with background merging:
+
+```python
+from inverted_index_builder.segments import BackgroundMerger, SegmentedIndex, TieredMergePolicy
+
+index = SegmentedIndex.open_or_create(Path("./seg-index"))
+with BackgroundMerger(index, TieredMergePolicy(merge_factor=4), interval_seconds=5.0):
+    index.add_documents(changed_pages)        # dicts in html-content-extractor's format
+    index.delete_urls(["https://example.com/gone"])
+index.compact(Path("./index"))                # optional: one v1 directory for old readers
+```
+
 ## Development
 
 ```bash
@@ -229,7 +322,10 @@ equivalence between composed and decomposed accented forms, locale-aware case
 folding, alphanumeric token boundaries), the index builder (an exact expected
 postings structure for a small fixed corpus, deterministic rebuilds, document length
 and corpus-wide statistics), the on-disk serialization format (ordering guarantees,
-manifest version checking) and the CLI.
+manifest version checking), the segmented index (updates as tombstone plus new
+segment, crash orphans removed on reopen, a merged index identical to a full
+rebuild of the same documents, deletes that arrive during a merge carried over,
+background merging while documents keep arriving) and the CLI.
 
 ## Troubleshooting
 
